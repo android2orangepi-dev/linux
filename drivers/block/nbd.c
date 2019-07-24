@@ -478,7 +478,7 @@ static int sock_xmit_buf(struct socket *sock, unsigned int direction,
 	struct iov_iter iter;
 	struct kvec iov = {.iov_base = buf, .iov_len = size};
 
-	iov_iter_kvec(&iter, WRITE | ITER_KVEC, &iov, 1, size);
+	iov_iter_kvec(&iter, WRITE, &iov, 1, size);
 	return sock_xmit(sock, direction, &iter, 0, 0);
 }
 
