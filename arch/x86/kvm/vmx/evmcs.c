@@ -3,6 +3,7 @@
 #include <linux/errno.h>
 #include <linux/smp.h>
 
+#include "../hyperv.h"
 #include "evmcs.h"
 #include "vmcs.h"
 #include "vmx.h"
@@ -313,6 +314,23 @@ void evmcs_sanitize_exec_ctrls(struct vmcs_config *vmcs_conf)
 }
 #endif
 
+bool nested_enlightened_vmentry(struct kvm_vcpu *vcpu, u64 *evmcs_gpa)
+{
+	struct hv_vp_assist_page assist_page;
+
+	*evmcs_gpa = -1ull;
+
+	if (unlikely(!kvm_hv_get_assist_page(vcpu, &assist_page)))
+		return false;
+
+	if (unlikely(!assist_page.enlighten_vmentry))
+		return false;
+
+	*evmcs_gpa = assist_page.current_nested_vmcs;
+
+	return true;
+}
+
 uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu)
 {
        struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -332,15 +350,16 @@ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
 			uint16_t *vmcs_version)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	bool evmcs_already_enabled = vmx->nested.enlightened_vmcs_enabled;
+
+	vmx->nested.enlightened_vmcs_enabled = true;
 
 	if (vmcs_version)
 		*vmcs_version = nested_get_evmcs_version(vcpu);
 
 	/* We don't support disabling the feature for simplicity. */
-	if (vmx->nested.enlightened_vmcs_enabled)
+	if (evmcs_already_enabled)
 		return 0;
-
-	vmx->nested.enlightened_vmcs_enabled = true;
 
 	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
 	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;

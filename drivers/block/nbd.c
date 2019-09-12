@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Network block device - make block devices work over TCP
  *
@@ -6,8 +7,6 @@
  * 
  * Copyright 1997-2000, 2008 Pavel Machek <pavel@ucw.cz>
  * Parts copyright 2001 Steven Whitehouse <steve@chygwyn.com>
- *
- * This file is released under GPLv2 or later.
  *
  * (part of code stolen from loop.c)
  */
@@ -43,6 +42,38 @@
 #include <linux/nbd.h>
 #include <linux/nbd-netlink.h>
 #include <net/genetlink.h>
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/nbd.h>
+
+#include <net/ipconfig.h>
+#include <linux/in.h>
+#include <linux/tcp.h>
+#include <linux/nfs_fs.h>
+#include <linux/nfs.h>
+
+#define ADDR_NONE cpu_to_be32(INADDR_NONE)
+
+static const char nbd_magic[] = "NBDMAGIC";
+static const u64 nbd_opts_magic = 0x49484156454F5054LL;
+
+/* Options used for the kernel driver */
+#define NBD_OPT_EXPORT_NAME 1
+
+#define NBD_DEFAULT_BLOCKSIZE 512 /* bytes */
+
+#define NBD_DEFAULT_TIMEOUT 2 /* seconds */
+
+#define NBD_MAXPATHLEN  NFS_MAXPATHLEN
+
+struct nbdroot {
+	const char *bdev;
+	__be32 server_addr;
+	__be32 server_port;
+	loff_t block_size;
+	int timeout;
+	char server_export[NBD_MAXPATHLEN + 1];
+};
 
 static DEFINE_IDR(nbd_index_idr);
 static DEFINE_MUTEX(nbd_index_mutex);
@@ -131,6 +162,8 @@ static struct dentry *nbd_dbg_dir;
 #define nbd_name(nbd) ((nbd)->disk->disk_name)
 
 #define NBD_MAGIC 0x68797548
+
+#define NBD_DEF_BLKSIZE 1024
 
 static unsigned int nbds_max = 16;
 static int max_part = 16;
@@ -402,21 +435,12 @@ done:
 /*
  *  Send or receive packet.
  */
-static int sock_xmit(struct nbd_device *nbd, int index, int send,
+static int sock_xmit(struct socket *sock, int send,
 		     struct iov_iter *iter, int msg_flags, int *sent)
 {
-	struct nbd_config *config = nbd->config;
-	struct socket *sock = config->socks[index]->sock;
 	int result;
 	struct msghdr msg;
 	unsigned int noreclaim_flag;
-
-	if (unlikely(!sock)) {
-		dev_err_ratelimited(disk_to_dev(nbd->disk),
-			"Attempted %s on closed socket in sock_xmit\n",
-			(send ? "send" : "recv"));
-		return -EINVAL;
-	}
 
 	msg.msg_iter = *iter;
 
@@ -446,6 +470,32 @@ static int sock_xmit(struct nbd_device *nbd, int index, int send,
 	memalloc_noreclaim_restore(noreclaim_flag);
 
 	return result;
+}
+
+static int sock_xmit_buf(struct socket *sock, unsigned int direction,
+			 void *buf, size_t size)
+{
+	struct iov_iter iter;
+	struct kvec iov = {.iov_base = buf, .iov_len = size};
+
+	iov_iter_kvec(&iter, WRITE, &iov, 1, size);
+	return sock_xmit(sock, direction, &iter, 0, 0);
+}
+
+static int nbd_xmit(struct nbd_device *nbd, int index, int send,
+		     struct iov_iter *iter, int msg_flags, int *sent)
+{
+	struct nbd_config *config = nbd->config;
+	struct socket *sock = config->socks[index]->sock;
+
+	if (unlikely(!sock)) {
+		dev_err_ratelimited(disk_to_dev(nbd->disk),
+			"Attempted %s on closed socket in %s\n",
+			(send ? "send" : "recv"), __func__);
+		return -EINVAL;
+	}
+
+	return sock_xmit(sock, send, iter, msg_flags, sent);
 }
 
 /*
@@ -510,6 +560,10 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 	if (sent) {
 		if (sent >= sizeof(request)) {
 			skip = sent - sizeof(request);
+
+			/* initialize handle for tracing purposes */
+			handle = nbd_cmd_handle(cmd);
+
 			goto send_pages;
 		}
 		iov_iter_advance(&from, sent);
@@ -526,11 +580,14 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 	handle = nbd_cmd_handle(cmd);
 	memcpy(request.handle, &handle, sizeof(handle));
 
+	trace_nbd_send_request(&request, nbd->index, blk_mq_rq_from_pdu(cmd));
+
 	dev_dbg(nbd_to_dev(nbd), "request %p: sending control (%s@%llu,%uB)\n",
 		req, nbdcmd_to_ascii(type),
 		(unsigned long long)blk_rq_pos(req) << 9, blk_rq_bytes(req));
-	result = sock_xmit(nbd, index, 1, &from,
+	result = nbd_xmit(nbd, index, 1, &from,
 			(type == NBD_CMD_WRITE) ? MSG_MORE : 0, &sent);
+	trace_nbd_header_sent(req, handle);
 	if (result <= 0) {
 		if (was_interrupted(result)) {
 			/* If we havne't sent anything we can just return BUSY,
@@ -574,7 +631,7 @@ send_pages:
 				iov_iter_advance(&from, skip);
 				skip = 0;
 			}
-			result = sock_xmit(nbd, index, 1, &from, flags, &sent);
+			result = nbd_xmit(nbd, index, 1, &from, flags, &sent);
 			if (result <= 0) {
 				if (was_interrupted(result)) {
 					/* We've already sent the header, we
@@ -603,6 +660,7 @@ send_pages:
 		bio = next;
 	}
 out:
+	trace_nbd_payload_sent(req, handle);
 	nsock->pending = NULL;
 	nsock->sent = 0;
 	return 0;
@@ -625,7 +683,7 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 
 	reply.magic = 0;
 	iov_iter_kvec(&to, READ, &iov, 1, sizeof(reply));
-	result = sock_xmit(nbd, index, 0, &to, MSG_WAITALL, NULL);
+	result = nbd_xmit(nbd, index, 0, &to, MSG_WAITALL, NULL);
 	if (result <= 0) {
 		if (!nbd_disconnected(config))
 			dev_err(disk_to_dev(nbd->disk),
@@ -650,6 +708,7 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 			tag, req);
 		return ERR_PTR(-ENOENT);
 	}
+	trace_nbd_header_received(req, handle);
 	cmd = blk_mq_rq_to_pdu(req);
 
 	mutex_lock(&cmd->lock);
@@ -679,7 +738,7 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 
 		rq_for_each_segment(bvec, req, iter) {
 			iov_iter_bvec(&to, READ, &bvec, 1, bvec.bv_len);
-			result = sock_xmit(nbd, index, 0, &to, MSG_WAITALL, NULL);
+			result = nbd_xmit(nbd, index, 0, &to, MSG_WAITALL, NULL);
 			if (result <= 0) {
 				dev_err(disk_to_dev(nbd->disk), "Receive data failed (result %d)\n",
 					result);
@@ -703,6 +762,7 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 		}
 	}
 out:
+	trace_nbd_payload_received(req, handle);
 	mutex_unlock(&cmd->lock);
 	return ret ? ERR_PTR(ret) : cmd;
 }
@@ -919,18 +979,12 @@ static blk_status_t nbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	return ret;
 }
 
-static int nbd_add_socket(struct nbd_device *nbd, unsigned long arg,
+static int nbd_add_socket(struct nbd_device *nbd, struct socket *sock,
 			  bool netlink)
 {
 	struct nbd_config *config = nbd->config;
-	struct socket *sock;
 	struct nbd_sock **socks;
 	struct nbd_sock *nsock;
-	int err;
-
-	sock = sockfd_lookup(arg, &err);
-	if (!sock)
-		return err;
 
 	if (!netlink && !nbd->task_setup &&
 	    !test_bit(NBD_BOUND, &config->runtime_flags))
@@ -970,6 +1024,19 @@ static int nbd_add_socket(struct nbd_device *nbd, unsigned long arg,
 	atomic_inc(&config->live_connections);
 
 	return 0;
+}
+
+static int nbd_add_socket_fd(struct nbd_device *nbd, unsigned long arg,
+			  bool netlink)
+{
+	struct socket *sock;
+	int err;
+
+	sock = sockfd_lookup(arg, &err);
+	if (!sock)
+		return err;
+
+	return nbd_add_socket(nbd, sock, netlink);
 }
 
 static int nbd_reconnect_socket(struct nbd_device *nbd, unsigned long arg)
@@ -1075,7 +1142,7 @@ static void send_disconnects(struct nbd_device *nbd)
 
 		iov_iter_kvec(&from, WRITE, &iov, 1, sizeof(request));
 		mutex_lock(&nsock->tx_lock);
-		ret = sock_xmit(nbd, i, 1, &from, 0, NULL);
+		ret = nbd_xmit(nbd, i, 1, &from, 0, NULL);
 		if (ret <= 0)
 			dev_err(disk_to_dev(nbd->disk),
 				"Send disconnect failed %d\n", ret);
@@ -1217,11 +1284,19 @@ static void nbd_clear_sock_ioctl(struct nbd_device *nbd,
 				 struct block_device *bdev)
 {
 	sock_shutdown(nbd);
-	kill_bdev(bdev);
+	__invalidate_device(bdev, true);
 	nbd_bdev_reset(bdev);
 	if (test_and_clear_bit(NBD_HAS_CONFIG_REF,
 			       &nbd->config->runtime_flags))
 		nbd_config_put(nbd);
+}
+
+static bool nbd_is_valid_blksize(unsigned long blksize)
+{
+	if (!blksize || !is_power_of_2(blksize) || blksize < 512 ||
+	    blksize > PAGE_SIZE)
+		return false;
+	return true;
 }
 
 /* Must be called with config_lock held */
@@ -1237,10 +1312,11 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
 		nbd_clear_sock_ioctl(nbd, bdev);
 		return 0;
 	case NBD_SET_SOCK:
-		return nbd_add_socket(nbd, arg, false);
+		return nbd_add_socket_fd(nbd, arg, false);
 	case NBD_SET_BLKSIZE:
-		if (!arg || !is_power_of_2(arg) || arg < 512 ||
-		    arg > PAGE_SIZE)
+		if (!arg)
+			arg = NBD_DEF_BLKSIZE;
+		if (!nbd_is_valid_blksize(arg))
 			return -EINVAL;
 		nbd_size_set(nbd, arg,
 			     div_s64(config->bytesize, arg));
@@ -1320,7 +1396,7 @@ static struct nbd_config *nbd_alloc_config(void)
 	atomic_set(&config->recv_threads, 0);
 	init_waitqueue_head(&config->recv_wq);
 	init_waitqueue_head(&config->conn_wait);
-	config->blksize = 1024;
+	config->blksize = NBD_DEF_BLKSIZE;
 	atomic_set(&config->live_connections, 0);
 	try_module_get(THIS_MODULE);
 	return config;
@@ -1571,7 +1647,7 @@ static int nbd_dev_add(int index)
 	nbd->tag_set.numa_node = NUMA_NO_NODE;
 	nbd->tag_set.cmd_size = sizeof(struct nbd_cmd);
 	nbd->tag_set.flags = BLK_MQ_F_SHOULD_MERGE |
-		BLK_MQ_F_SG_MERGE | BLK_MQ_F_BLOCKING;
+		BLK_MQ_F_BLOCKING;
 	nbd->tag_set.driver_data = nbd;
 
 	err = blk_mq_alloc_tag_set(&nbd->tag_set);
@@ -1661,6 +1737,30 @@ nbd_device_policy[NBD_DEVICE_ATTR_MAX + 1] = {
 	[NBD_DEVICE_CONNECTED]		=	{ .type = NLA_U8 },
 };
 
+static int nbd_genl_size_set(struct genl_info *info, struct nbd_device *nbd)
+{
+	struct nbd_config *config = nbd->config;
+	u64 bsize = config->blksize;
+	u64 bytes = config->bytesize;
+
+	if (info->attrs[NBD_ATTR_SIZE_BYTES])
+		bytes = nla_get_u64(info->attrs[NBD_ATTR_SIZE_BYTES]);
+
+	if (info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]) {
+		bsize = nla_get_u64(info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]);
+		if (!bsize)
+			bsize = NBD_DEF_BLKSIZE;
+		if (!nbd_is_valid_blksize(bsize)) {
+			printk(KERN_ERR "Invalid block size %llu\n", bsize);
+			return -EINVAL;
+		}
+	}
+
+	if (bytes != config->bytesize || bsize != config->blksize)
+		nbd_size_set(nbd, bsize, div64_u64(bytes, bsize));
+	return 0;
+}
+
 static int nbd_genl_connect(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nbd_device *nbd = NULL;
@@ -1748,16 +1848,10 @@ again:
 	refcount_set(&nbd->config_refs, 1);
 	set_bit(NBD_BOUND, &config->runtime_flags);
 
-	if (info->attrs[NBD_ATTR_SIZE_BYTES]) {
-		u64 bytes = nla_get_u64(info->attrs[NBD_ATTR_SIZE_BYTES]);
-		nbd_size_set(nbd, config->blksize,
-			     div64_u64(bytes, config->blksize));
-	}
-	if (info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]) {
-		u64 bsize =
-			nla_get_u64(info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]);
-		nbd_size_set(nbd, bsize, div64_u64(config->bytesize, bsize));
-	}
+	ret = nbd_genl_size_set(info, nbd);
+	if (ret)
+		goto out;
+
 	if (info->attrs[NBD_ATTR_TIMEOUT]) {
 		u64 timeout = nla_get_u64(info->attrs[NBD_ATTR_TIMEOUT]);
 		nbd->tag_set.timeout = timeout * HZ;
@@ -1797,8 +1891,10 @@ again:
 				ret = -EINVAL;
 				goto out;
 			}
-			ret = nla_parse_nested(socks, NBD_SOCK_MAX, attr,
-					       nbd_sock_policy, info->extack);
+			ret = nla_parse_nested_deprecated(socks, NBD_SOCK_MAX,
+							  attr,
+							  nbd_sock_policy,
+							  info->extack);
 			if (ret != 0) {
 				printk(KERN_ERR "nbd: error processing sock list\n");
 				ret = -EINVAL;
@@ -1807,7 +1903,7 @@ again:
 			if (!socks[NBD_SOCK_FD])
 				continue;
 			fd = (int)nla_get_u32(socks[NBD_SOCK_FD]);
-			ret = nbd_add_socket(nbd, fd, true);
+			ret = nbd_add_socket_fd(nbd, fd, true);
 			if (ret)
 				goto out;
 		}
@@ -1924,6 +2020,10 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 		goto out;
 	}
 
+	ret = nbd_genl_size_set(info, nbd);
+	if (ret)
+		goto out;
+
 	if (info->attrs[NBD_ATTR_TIMEOUT]) {
 		u64 timeout = nla_get_u64(info->attrs[NBD_ATTR_TIMEOUT]);
 		nbd->tag_set.timeout = timeout * HZ;
@@ -1968,8 +2068,10 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 				ret = -EINVAL;
 				goto out;
 			}
-			ret = nla_parse_nested(socks, NBD_SOCK_MAX, attr,
-					       nbd_sock_policy, info->extack);
+			ret = nla_parse_nested_deprecated(socks, NBD_SOCK_MAX,
+							  attr,
+							  nbd_sock_policy,
+							  info->extack);
 			if (ret != 0) {
 				printk(KERN_ERR "nbd: error processing sock list\n");
 				ret = -EINVAL;
@@ -1999,22 +2101,22 @@ out:
 static const struct genl_ops nbd_connect_genl_ops[] = {
 	{
 		.cmd	= NBD_CMD_CONNECT,
-		.policy	= nbd_attr_policy,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit	= nbd_genl_connect,
 	},
 	{
 		.cmd	= NBD_CMD_DISCONNECT,
-		.policy	= nbd_attr_policy,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit	= nbd_genl_disconnect,
 	},
 	{
 		.cmd	= NBD_CMD_RECONFIGURE,
-		.policy	= nbd_attr_policy,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit	= nbd_genl_reconfigure,
 	},
 	{
 		.cmd	= NBD_CMD_STATUS,
-		.policy	= nbd_attr_policy,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit	= nbd_genl_status,
 	},
 };
@@ -2031,6 +2133,7 @@ static struct genl_family nbd_genl_family __ro_after_init = {
 	.ops		= nbd_connect_genl_ops,
 	.n_ops		= ARRAY_SIZE(nbd_connect_genl_ops),
 	.maxattr	= NBD_ATTR_MAX,
+	.policy = nbd_attr_policy,
 	.mcgrps		= nbd_mcast_grps,
 	.n_mcgrps	= ARRAY_SIZE(nbd_mcast_grps),
 };
@@ -2050,7 +2153,7 @@ static int populate_nbd_status(struct nbd_device *nbd, struct sk_buff *reply)
 	 */
 	if (refcount_read(&nbd->config_refs))
 		connected = 1;
-	dev_opt = nla_nest_start(reply, NBD_DEVICE_ITEM);
+	dev_opt = nla_nest_start_noflag(reply, NBD_DEVICE_ITEM);
 	if (!dev_opt)
 		return -EMSGSIZE;
 	ret = nla_put_u32(reply, NBD_DEVICE_INDEX, nbd->index);
@@ -2098,7 +2201,7 @@ static int nbd_genl_status(struct sk_buff *skb, struct genl_info *info)
 		goto out;
 	}
 
-	dev_list = nla_nest_start(reply, NBD_ATTR_DEVICE_LIST);
+	dev_list = nla_nest_start_noflag(reply, NBD_ATTR_DEVICE_LIST);
 	if (index == -1) {
 		ret = idr_for_each(&nbd_index_idr, &status_cb, reply);
 		if (ret) {
@@ -2118,8 +2221,7 @@ static int nbd_genl_status(struct sk_buff *skb, struct genl_info *info)
 	}
 	nla_nest_end(reply, dev_list);
 	genlmsg_end(reply, reply_head);
-	genlmsg_reply(reply, info);
-	ret = 0;
+	ret = genlmsg_reply(reply, info);
 out:
 	mutex_unlock(&nbd_index_mutex);
 	return ret;
@@ -2270,6 +2372,261 @@ static void __exit nbd_cleanup(void)
 	destroy_workqueue(recv_workqueue);
 	unregister_blkdev(NBD_MAJOR, "nbd");
 }
+
+#ifdef CONFIG_BLK_DEV_NBDROOT
+
+struct nbdroot nbdroot_0 = {.bdev = "nbd0",
+			    .server_export = "",
+			    .server_addr = ADDR_NONE,
+			    .timeout = NBD_DEFAULT_TIMEOUT,
+			    .block_size = NBD_DEFAULT_BLOCKSIZE};
+
+static int nbd_connect(struct nbdroot *nbdroot, struct socket **socket)
+{
+	struct socket *sock;
+	struct sockaddr_in sockaddr;
+	int err;
+	char val;
+
+	err = sock_create_kern(&init_net, AF_INET, SOCK_STREAM,
+			       IPPROTO_TCP, &sock);
+	if (err < 0)
+		return err;
+
+	sockaddr.sin_family = AF_INET;
+	sockaddr.sin_addr.s_addr = nbdroot->server_addr;
+	sockaddr.sin_port = nbdroot->server_port;
+
+	val = 1;
+	sock->ops->setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val,
+			      sizeof(val));
+
+	err = sock->ops->connect(sock, (struct sockaddr *)&sockaddr,
+				 sizeof(sockaddr), 0);
+	if (err < 0)
+		return err;
+
+	*socket = sock;
+
+	return 0;
+}
+
+static int nbd_connection_negotiate(struct socket *sock, char *export_name,
+				    size_t *rsize, u16 *nflags)
+{
+	char buf[256];
+	int ret;
+	u64 magic;
+	u16 flags;
+	u32 client_flags;
+	u32 opt;
+	u32 name_len;
+	u64 nbd_size;
+
+	ret = sock_xmit_buf(sock, READ, buf, 8);
+	if (ret < 0)
+		return ret;
+
+	if (strncmp(buf, nbd_magic, 8))
+		return -EINVAL;
+
+	ret = sock_xmit_buf(sock, READ, &magic, sizeof(magic));
+	if (ret < 0)
+		return ret;
+	magic = be64_to_cpu(magic);
+
+	if (magic != nbd_opts_magic)
+		return -EINVAL;
+
+	ret = sock_xmit_buf(sock, READ, &flags, sizeof(flags));
+	if (ret < 0)
+		return ret;
+
+	*nflags = ntohs(flags);
+
+	client_flags = 0;
+
+	ret = sock_xmit_buf(sock, WRITE, &client_flags, sizeof(client_flags));
+	if (ret < 0)
+		return ret;
+
+	magic = cpu_to_be64(nbd_opts_magic);
+	ret = sock_xmit_buf(sock, WRITE, &magic, sizeof(magic));
+	if (ret < 0)
+		return ret;
+
+	opt = htonl(NBD_OPT_EXPORT_NAME);
+	ret = sock_xmit_buf(sock, WRITE, &opt, sizeof(opt));
+	if (ret < 0)
+		return ret;
+
+	name_len = strlen(export_name) + 1;
+	name_len = htonl(name_len);
+	ret = sock_xmit_buf(sock, WRITE, &name_len, sizeof(name_len));
+	if (ret < 0)
+		return ret;
+
+	ret = sock_xmit_buf(sock, WRITE, export_name, strlen(export_name) + 1);
+	if (ret < 0)
+		return ret;
+
+	ret = sock_xmit_buf(sock, READ, &nbd_size, sizeof(nbd_size));
+	if (ret < 0)
+		return ret;
+	nbd_size = be64_to_cpu(nbd_size);
+
+	ret = sock_xmit_buf(sock, READ, &flags, sizeof(flags));
+	if (ret < 0)
+		return ret;
+	*nflags = ntohs(flags);
+
+	ret = sock_xmit_buf(sock, READ, buf, 124);
+	if (ret < 0)
+		return ret;
+
+	*rsize = nbd_size;
+
+	return 0;
+}
+
+static int nbd_bind_connection(struct nbdroot *nbdroot, struct nbd_device *nbd,
+			       struct socket *sock, size_t rsize, u32 flags)
+{
+	int conn, ret;
+	struct block_device *bdev = blkdev_get_by_dev(disk_devt(nbd->disk),
+					FMODE_READ | FMODE_WRITE, 0);
+
+	if (IS_ERR(bdev)) {
+		pr_err("nbdroot: blkdev_get_by_dev failed %ld\n",
+		       PTR_ERR(bdev));
+		return PTR_ERR(bdev);
+	}
+
+	conn = nbd->config->num_connections;
+	ret = nbd_add_socket(nbd, sock, false);
+	if (ret) {
+		pr_err("nbdroot: add socket failed %d\n", ret);
+		return ret;
+	}
+
+	mutex_lock(&nbd->config->socks[conn]->tx_lock);
+
+	nbd->config->flags = flags;
+
+	nbd_size_set(nbd, nbdroot->block_size,
+		     div_s64(rsize, nbdroot->block_size));
+
+	nbd->tag_set.timeout = nbdroot->timeout * HZ;
+	blk_queue_rq_timeout(nbd->disk->queue, nbdroot->timeout * HZ);
+
+	mutex_unlock(&nbd->config->socks[conn]->tx_lock);
+
+	ret = nbd_start_device_ioctl(nbd, bdev);
+	if (ret) {
+		pr_err("nbdroot: start device ioctl failed %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int nbdroot_thread(void *arg)
+{
+	struct nbdroot *nbdroot = (struct nbdroot *)arg;
+	struct socket *sock = 0;
+	size_t rsize;
+	u16 nflags;
+	int ret;
+	dev_t devt = blk_lookup_devt(nbdroot->bdev, 0);
+	struct gendisk *disk = get_gendisk(devt, &ret);
+	struct nbd_device *nbd = (struct nbd_device *)disk->private_data;
+
+	ret = nbd_connect(nbdroot, &sock);
+	if (ret) {
+		pr_err("nbdroot: connect failed %d\n", ret);
+		goto err;
+	}
+
+	ret = nbd_connection_negotiate(sock, nbdroot->server_export,
+				       &rsize, &nflags);
+	if (ret) {
+		pr_err("nbdroot: negotiation failed %d\n", ret);
+		goto err;
+	}
+
+	ret = nbd_bind_connection(nbdroot, nbd, sock, rsize, nflags);
+	if (ret) {
+		pr_err("nbdroot: nbd_bind_connection failed %d\n", ret);
+		goto err;
+	}
+	return 0;
+
+err:
+	pr_err("nbdroot: %s init failed, IP: %pI4, port: %i, export: %s\n",
+	       nbdroot->bdev, &nbdroot->server_addr,
+	       ntohs(nbdroot->server_port), nbdroot->server_export);
+
+	if (sock)
+		sock_release(sock);
+
+	return ret;
+}
+
+static int __init nbdroot_init(void)
+{
+	if (nbdroot_0.server_port != 0)
+		kthread_run(nbdroot_thread, &nbdroot_0, "nbdroot_0");
+
+	return 0;
+}
+
+/* We need this in late_initcall_sync to be sure that the network is setup */
+late_initcall_sync(nbdroot_init);
+
+/*
+ * Parse format "[<SERVER_IP>:]<SERVER_PORT>/<EXPORT_NAME>"
+ */
+static int __init nbdroot_setup(char *line)
+{
+	struct nbdroot *nbdroot = &nbdroot_0;
+	char *export;
+	u16 port;
+	int ret;
+	char buf[NBD_MAXPATHLEN + 1];
+
+	strlcpy(buf, line, sizeof(buf) - 1);
+
+	nbdroot->server_addr = root_nfs_parse_addr(buf);
+
+	if (*buf == '\0')
+		return -EINVAL;
+
+	if (nbdroot->server_addr == ADDR_NONE) {
+		if (root_server_addr == ADDR_NONE) {
+			pr_err("nbdroot: Failed to find server address\n");
+			return -EINVAL;
+		}
+		nbdroot->server_addr = root_server_addr;
+	}
+
+	export = strchr(buf, '/');
+	*export = '\0';
+	++export;
+
+	ret = kstrtou16(buf, 10, &port);
+	if (ret)
+		return ret;
+
+	nbdroot->server_port = htons(port);
+	strlcpy(nbdroot->server_export, export,
+		sizeof(nbdroot->server_export) - 1);
+
+	return 0;
+}
+
+__setup("nbdroot=", nbdroot_setup);
+
+#endif /* CONFIG_BLK_DEV_NBDROOT */
 
 module_init(nbd_init);
 module_exit(nbd_cleanup);

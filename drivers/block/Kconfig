@@ -31,7 +31,7 @@ config BLK_DEV_FD
 	  If you want to use the floppy disk drive(s) of your PC under Linux,
 	  say Y. Information about this driver, especially important for IBM
 	  Thinkpad users, is contained in
-	  <file:Documentation/blockdev/floppy.txt>.
+	  <file:Documentation/admin-guide/blockdev/floppy.rst>.
 	  That file also contains the location of the Floppy driver FAQ as
 	  well as location of the fdutils package used to configure additional
 	  parameters of the driver at run time.
@@ -96,7 +96,7 @@ config PARIDE
 	  your computer's parallel port. Most of them are actually IDE devices
 	  using a parallel port IDE adapter. This option enables the PARIDE
 	  subsystem which contains drivers for many of these external drives.
-	  Read <file:Documentation/blockdev/paride.txt> for more information.
+	  Read <file:Documentation/admin-guide/blockdev/paride.rst> for more information.
 
 	  If you have said Y to the "Parallel-port support" configuration
 	  option, you may share a single port between your printer and other
@@ -261,7 +261,7 @@ config BLK_DEV_NBD
 	  userland (making server and client physically the same computer,
 	  communicating using the loopback network device).
 
-	  Read <file:Documentation/blockdev/nbd.txt> for more information,
+	  Read <file:Documentation/admin-guide/blockdev/nbd.rst> for more information,
 	  especially about where to find the server code, which runs in user
 	  space and does not need special kernel support.
 
@@ -270,6 +270,25 @@ config BLK_DEV_NBD
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called nbd.
+
+	  If unsure, say N.
+
+config BLK_DEV_NBDROOT
+	bool "Early network block device client support"
+	depends on BLK_DEV_NBD=y
+	---help---
+	  Saying yes will enable kernel NBD client support. This allows to
+	  connect entire disk with multiple partitions before mounting rootfs.
+
+	  The arguments for the server are passed via kernel command line.
+	  The kernel command line has the format
+	  'nbdroot=[<SERVER_IP>:]<SERVER_PORT>/<EXPORT_NAME>'.
+	  SERVER_IP is optional. If it is not available it will use the
+	  root_server_addr transmitted through DHCP.
+
+	  Based on those arguments, the connection to the server is established
+	  and is connected to the nbd0 device. The rootdevice therefore is
+	  root=/dev/nbd0.
 
 	  If unsure, say N.
 
@@ -303,7 +322,7 @@ config BLK_DEV_RAM
 	  during the initial install of Linux.
 
 	  Note that the kernel command line option "ramdisk=XX" is now obsolete.
-	  For details, read <file:Documentation/blockdev/ramdisk.txt>.
+	  For details, read <file:Documentation/admin-guide/blockdev/ramdisk.rst>.
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called brd. An alias "rd" has been defined
@@ -347,7 +366,7 @@ config CDROM_PKTCDVD
 	  is possible.
 	  DVD-RW disks must be in restricted overwrite mode.
 
-	  See the file <file:Documentation/cdrom/packet-writing.txt>
+	  See the file <file:Documentation/cdrom/packet-writing.rst>
 	  for further information on the use of this driver.
 
 	  To compile this driver as a module, choose M here: the
